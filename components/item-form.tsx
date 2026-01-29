@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react"
+import React, { useCallback } from "react"
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
@@ -38,7 +38,7 @@ export function ItemForm() {
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
 
@@ -67,7 +67,7 @@ export function ItemForm() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [formData, router]);
 
   return (
     <Card className="max-w-2xl mx-auto">
