@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react"
+import React, { useCallback, useMemo } from "react"
 
 import { useState, useEffect } from "react";
 import { db } from "@/lib/firebase";
@@ -25,12 +25,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Loader2, Plus, Trash2, Send, FileText, Printer } from "lucide-react";
+import { Loader2, Plus, Trash2, Send, FileText, Printer, Archive, ArchiveRestore } from "lucide-react";
 import type { Item, RequisitionItem } from "@/lib/types";
+import { getCachedQuery, setCachedQuery } from "@/lib/utils";
+import { deleteDoc, doc, updateDoc } from "firebase/firestore";
 
 export function RequisitionForm() {
+  const [view, setView] = useState<"form" | "records" | "print">("form");
   const [loading, setLoading] = useState(false);
   const [itemsLoading, setItemsLoading] = useState(true);
+  const [recordsLoading, setRecordsLoading] = useState(false);
   const [availableItems, setAvailableItems] = useState<Item[]>([]);
   const [requisitionItems, setRequisitionItems] = useState<RequisitionItem[]>([]);
   const [selectedItemId, setSelectedItemId] = useState("");
@@ -40,6 +44,10 @@ export function RequisitionForm() {
     formData: typeof formData;
     items: RequisitionItem[];
   } | null>(null);
+  const [submittedRequisitions, setSubmittedRequisitions] = useState<any[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editingRequisitionId, setEditingRequisitionId] = useState<string | null>(null);
 
   const [formData, setFormData] = useState({
     requestDate: new Date().toISOString().split("T")[0],
@@ -50,17 +58,29 @@ export function RequisitionForm() {
     preparedBy: "",
     notedBy: "",
     approvedBy: "",
+    approvedByCOO: "",
   });
 
   useEffect(() => {
     const fetchItems = async () => {
       try {
+        // Check cache first
+        const cached = getCachedQuery<Item[]>("items_list");
+        if (cached) {
+          setAvailableItems(cached);
+          setItemsLoading(false);
+          return;
+        }
+
         const q = query(collection(db, "items"), orderBy("itemName"));
         const snapshot = await getDocs(q);
         const itemsData = snapshot.docs.map((doc) => ({
           id: doc.id,
           ...doc.data(),
         })) as Item[];
+        
+        // Cache the results
+        setCachedQuery("items_list", itemsData);
         setAvailableItems(itemsData);
       } catch (error) {
         console.error("Error fetching items:", error);
@@ -75,22 +95,19 @@ export function RequisitionForm() {
     try {
       const q = query(collection(db, "requisitions"), orderBy("createdAt", "desc"), limit(1));
       const snapshot = await getDocs(q);
-      const date = new Date();
-      const month = String(date.getMonth() + 1).padStart(2, "0");
-      const year = date.getFullYear();
       
       if (snapshot.empty) {
-        return `FL.RF.01.${month}${year}`;
+        return `FL.RF.01`;
       }
       const lastReq = snapshot.docs[0].data();
       const lastNumber = parseInt(lastReq.requisitionNumber.split(".")[2]) || 0;
-      return `FL.RF.${String(lastNumber + 1).padStart(2, "0")}.${month}${year}`;
+      return `FL.RF.${String(lastNumber + 1).padStart(2, "0")}`;
     } catch {
-      return `FL.RF.01.${new Date().toISOString().slice(0, 7).replace("-", "")}`;
+      return `FL.RF.01`;
     }
   };
 
-  const handleAddItem = () => {
+  const handleAddItem = useCallback(() => {
     if (!selectedItemId || !quantity) return;
 
     const item = availableItems.find((i) => i.id === selectedItemId);
@@ -117,12 +134,11 @@ export function RequisitionForm() {
 
     setSelectedItemId("");
     setQuantity("1");
-  };
+  }, [selectedItemId, quantity, availableItems, requisitionItems]);
 
-  const handleRemoveItem = (index: number) => {
+  const handleRemoveItem = useCallback((index: number) => {
     setRequisitionItems(requisitionItems.filter((_, i) => i !== index));
-  };
-
+  }, [requisitionItems]);
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (requisitionItems.length === 0) {
@@ -133,6 +149,8 @@ export function RequisitionForm() {
     setLoading(true);
     try {
       const requisitionNumber = await generateRequisitionNumber();
+      
+      // Save to database
       await addDoc(collection(db, "requisitions"), {
         requisitionNumber,
         ...formData,
@@ -148,7 +166,10 @@ export function RequisitionForm() {
         items: [...requisitionItems],
       });
 
-      alert(`Requisition ${requisitionNumber} submitted successfully! You can now print it.`);
+      // Set view to print
+      setView("print");
+      setIsEditing(false);
+      setEditingRequisitionId(null);
     } catch (error) {
       console.error("Error submitting requisition:", error);
       alert("Failed to submit requisition. Please check your Firebase configuration.");
@@ -164,7 +185,10 @@ export function RequisitionForm() {
 
   const handleNewRequisition = () => {
     setSubmittedRequisition(null);
+    setView("form");
     setRequisitionItems([]);
+    setIsEditing(false);
+    setEditingRequisitionId(null);
     setFormData({
       requestDate: new Date().toISOString().split("T")[0],
       needDate: "",
@@ -174,10 +198,94 @@ export function RequisitionForm() {
       preparedBy: "",
       notedBy: "",
       approvedBy: "",
+      approvedByCOO: "",
     });
   };
 
-  const totalAmount = requisitionItems.reduce((sum, item) => sum + item.totalPrice, 0);
+  const fetchSubmittedRequisitions = async () => {
+    setRecordsLoading(true);
+    try {
+      const q = query(collection(db, "requisitions"), orderBy("createdAt", "desc"));
+      const snapshot = await getDocs(q);
+      const requisitionsData = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      setSubmittedRequisitions(requisitionsData);
+    } catch (error) {
+      console.error("Error fetching requisitions:", error);
+    } finally {
+      setRecordsLoading(false);
+    }
+  };
+
+  const handleViewRecords = () => {
+    setView("records");
+    fetchSubmittedRequisitions();
+  };
+
+  const handleViewPrint = (req: any) => {
+    setSubmittedRequisition({
+      requisitionNumber: req.requisitionNumber,
+      formData: req,
+      items: req.items || [],
+    });
+    setView("print");
+  };
+
+  const handleEditRequisition = (req: any) => {
+    setIsEditing(true);
+    setEditingRequisitionId(req.id);
+    setRequisitionItems(req.items || []);
+    setFormData({
+      requestDate: req.requestDate || "",
+      needDate: req.needDate || "",
+      department: req.department || "",
+      unitSection: req.unitSection || "",
+      remarks: req.remarks || "",
+      preparedBy: req.preparedBy || "",
+      notedBy: req.notedBy || "",
+      approvedBy: req.approvedBy || "",
+      approvedByCOO: req.approvedByCOO || "",
+    });
+    setView("form");
+  };
+
+  const handleDeleteRequisition = async (id: string) => {
+    if (!window.confirm("Are you sure you want to delete this requisition? This action cannot be undone.")) {
+      return;
+    }
+    
+    try {
+      await deleteDoc(doc(db, "requisitions", id));
+      setSubmittedRequisitions(submittedRequisitions.filter((req) => req.id !== id));
+    } catch (error) {
+      console.error("Error deleting requisition:", error);
+      alert("Failed to delete requisition.");
+    }
+  };
+
+  const handleArchiveRequisition = async (id: string, currentStatus: string) => {
+    const newStatus = currentStatus === "archived" ? "pending" : "archived";
+    
+    try {
+      await updateDoc(doc(db, "requisitions", id), {
+        status: newStatus,
+      });
+      
+      setSubmittedRequisitions(submittedRequisitions.map((req) => 
+        req.id === id ? { ...req, status: newStatus } : req
+      ));
+    } catch (error) {
+      console.error("Error updating requisition status:", error);
+      alert("Failed to update requisition status.");
+    }
+  };
+
+  const totalAmount = useMemo(() => 
+    requisitionItems.reduce((sum, item) => sum + item.totalPrice, 0),
+    [requisitionItems]
+  );
 
   const formatCurrency = (amount: number) =>
     new Intl.NumberFormat("en-PH", { style: "currency", currency: "PHP" }).format(amount);
@@ -192,7 +300,7 @@ export function RequisitionForm() {
   };
 
   // Show printable view after submission
-  if (submittedRequisition) {
+  if (view === "print" && submittedRequisition) {
     const printTotalAmount = submittedRequisition.items.reduce((sum, item) => sum + item.totalPrice, 0);
     
     return (
@@ -211,20 +319,35 @@ export function RequisitionForm() {
               left: 0;
               top: 0;
               width: 100%;
-              padding: 20px;
+              padding: 0;
             }
             .no-print {
               display: none !important;
             }
             @page {
               size: A4;
-              margin: 15mm;
+              margin: 10mm;
+            }
+            .print-area {
+              font-family: Arial, sans-serif;
+              font-size: 11pt;
+            }
+            .print-area table {
+              border-collapse: collapse;
+              width: 100%;
+            }
+            .print-area td, .print-area th {
+              border: 1px solid #000;
+              padding: 4px;
             }
           }
         `}</style>
 
         {/* Action Buttons - Hidden during print */}
         <div className="no-print max-w-5xl mx-auto mb-4 flex gap-3 justify-end">
+          <Button variant="outline" onClick={handleViewRecords}>
+            View Records
+          </Button>
           <Button variant="outline" onClick={handleNewRequisition}>
             Create New Requisition
           </Button>
@@ -235,101 +358,120 @@ export function RequisitionForm() {
         </div>
 
         {/* Printable Requisition Form */}
-        <div className="print-area max-w-5xl mx-auto bg-card border rounded-lg p-8">
-          {/* Header */}
-          <div className="text-center mb-6 border-b pb-4">
-            <h1 className="text-2xl font-bold">Requisition Form</h1>
-            <p className="text-lg font-semibold text-primary mt-2">
+        <div className="print-area max-w-5xl mx-auto bg-white p-4" style={{fontFamily: "Arial, sans-serif", fontSize: "11pt"}}>
+          {/* Header with logo */}
+          <div style={{display: "flex", justifyContent: "flex-start", alignItems: "flex-start", marginBottom: "12px"}}>
+            <div>
+              <img 
+                src="/visayasmed logo_circular-02.png" 
+                alt="Logo" 
+                style={{height: "80px", width: "auto"}}
+              />
+            </div>
+          </div>
+          
+          <div className="text-center mb-3">
+            <h1 style={{fontSize: "16pt", fontWeight: "bold", marginBottom: "4px"}}>Requisition Form</h1>
+            <p style={{fontSize: "13pt", fontWeight: "bold", color: "#0066cc", marginBottom: "0"}}>
               {submittedRequisition.requisitionNumber}
             </p>
           </div>
 
-          {/* Form Details */}
-          <div className="grid grid-cols-2 gap-x-12 gap-y-4 mb-6">
-            <div className="flex">
-              <span className="font-semibold w-32">Request Date:</span>
+          {/* Form Details in 2x2 grid */}
+          <div className="mb-3" style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px"}}>
+            <div style={{display: "flex"}}>
+              <span style={{fontWeight: "bold", width: "100px", flexShrink: 0}}>Request Date:</span>
               <span>{formatDate(submittedRequisition.formData.requestDate)}</span>
             </div>
-            <div className="flex">
-              <span className="font-semibold w-32">Need Date:</span>
+            <div style={{display: "flex"}}>
+              <span style={{fontWeight: "bold", width: "100px", flexShrink: 0}}>Need Date:</span>
               <span>{formatDate(submittedRequisition.formData.needDate)}</span>
             </div>
-            <div className="flex">
-              <span className="font-semibold w-32">Department:</span>
+            <div style={{display: "flex"}}>
+              <span style={{fontWeight: "bold", width: "100px", flexShrink: 0}}>Department:</span>
               <span>{submittedRequisition.formData.department}</span>
             </div>
-            <div className="flex">
-              <span className="font-semibold w-32">Unit/Section:</span>
+            <div style={{display: "flex"}}>
+              <span style={{fontWeight: "bold", width: "100px", flexShrink: 0}}>Unit/Section:</span>
               <span>{submittedRequisition.formData.unitSection || "N/A"}</span>
             </div>
           </div>
 
-          {/* Items Table */}
-          <div className="border rounded-lg overflow-hidden mb-6">
-            <Table>
-              <TableHeader>
-                <TableRow className="bg-muted">
-                  <TableHead className="font-bold text-foreground">Qty</TableHead>
-                  <TableHead className="font-bold text-foreground">UOM</TableHead>
-                  <TableHead className="font-bold text-foreground">Description</TableHead>
-                  <TableHead className="font-bold text-foreground text-right">Unit Price</TableHead>
-                  <TableHead className="font-bold text-foreground text-right">Total Price</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {submittedRequisition.items.map((item, index) => (
-                  <TableRow key={index}>
-                    <TableCell>{item.quantity}</TableCell>
-                    <TableCell>{item.unitOfMeasure}</TableCell>
-                    <TableCell>
-                      <span className="font-medium">{item.itemName}</span>
-                      {item.description && (
-                        <span className="text-sm text-muted-foreground block">{item.description}</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right">{formatCurrency(item.unitPrice)}</TableCell>
-                    <TableCell className="text-right">{formatCurrency(item.totalPrice)}</TableCell>
-                  </TableRow>
-                ))}
-                <TableRow className="bg-muted/50">
-                  <TableCell colSpan={4} className="text-right font-bold">
-                    Grand Total:
-                  </TableCell>
-                  <TableCell className="text-right font-bold text-lg">
-                    {formatCurrency(printTotalAmount)}
-                  </TableCell>
-                </TableRow>
-              </TableBody>
-            </Table>
-          </div>
+          {/* Items Table - Excel style */}
+          <table style={{borderCollapse: "collapse", width: "100%", marginBottom: "8px"}}>
+            <thead>
+              <tr style={{backgroundColor: "#e0e0e0"}}>
+                <th style={{border: "1px solid #000", padding: "4px", fontWeight: "bold", width: "40px", textAlign: "center"}}>Qty</th>
+                <th style={{border: "1px solid #000", padding: "4px", fontWeight: "bold", width: "50px", textAlign: "center"}}>UOM</th>
+                <th style={{border: "1px solid #000", padding: "4px", fontWeight: "bold", textAlign: "left"}}>Description</th>
+                <th style={{border: "1px solid #000", padding: "4px", fontWeight: "bold", width: "80px", textAlign: "right"}}>Unit Price</th>
+                <th style={{border: "1px solid #000", padding: "4px", fontWeight: "bold", width: "80px", textAlign: "center"}}>Total Price</th>
+              </tr>
+            </thead>
+            <tbody>
+              {submittedRequisition.items.map((item, index) => (
+                <tr key={index}>
+                  <td style={{border: "1px solid #000", padding: "4px", textAlign: "center"}}>{item.quantity}</td>
+                  <td style={{border: "1px solid #000", padding: "4px", textAlign: "center"}}>{item.unitOfMeasure}</td>
+                  <td style={{border: "1px solid #000", padding: "4px"}}>
+                    <div style={{fontWeight: "500"}}>{item.itemName}</div>
+                    {item.description && (
+                      <div style={{fontSize: "9pt", color: "#666"}}>{item.description}</div>
+                    )}
+                  </td>
+                  <td style={{border: "1px solid #000", padding: "4px", textAlign: "right"}}>{formatCurrency(item.unitPrice)}</td>
+                  <td style={{border: "1px solid #000", padding: "4px", textAlign: "right"}}>{formatCurrency(item.totalPrice)}</td>
+                </tr>
+              ))}
+              <tr style={{backgroundColor: "#f0f0f0", fontWeight: "bold"}}>
+                <td colSpan={4} style={{border: "1px solid #000", padding: "4px", textAlign: "right"}}>Grand Total:</td>
+                <td style={{border: "1px solid #000", padding: "4px", textAlign: "right", fontWeight: "bold"}}>
+                  {formatCurrency(printTotalAmount)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
 
           {/* Remarks */}
           {submittedRequisition.formData.remarks && (
-            <div className="mb-6">
-              <span className="font-semibold">Remarks:</span>
-              <p className="mt-1 p-3 bg-muted/30 rounded">{submittedRequisition.formData.remarks}</p>
+            <div className="mb-3">
+              <span style={{fontWeight: "bold"}}>Remarks:</span>
+              <p style={{marginTop: "2px", padding: "3px", backgroundColor: "#f5f5f5", border: "1px solid #ddd"}}>
+                {submittedRequisition.formData.remarks}
+              </p>
             </div>
           )}
 
-          {/* Signatures */}
-          <div className="grid grid-cols-3 gap-8 mt-12 pt-6 border-t">
-            <div className="text-center">
-              <div className="border-b border-foreground pb-1 mb-2 min-h-[60px] flex items-end justify-center">
-                <span className="font-medium">{submittedRequisition.formData.preparedBy}</span>
+          {/* Signature Section - Underline style */}
+          <div style={{marginTop: "40px", paddingTop: "16px", borderTop: "2px solid #000"}}>
+            <div style={{display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "16px"}}>
+              <div style={{textAlign: "center"}}>
+                <span style={{fontSize: "11pt", fontWeight: "bold", display: "block", marginBottom: "4px"}}>Prepared By:</span>
+                <div style={{borderBottom: "1.5px solid #000", height: "24px", marginBottom: "6px", display: "flex", alignItems: "flex-end", justifyContent: "center"}}>
+                  <span style={{fontSize: "10pt", marginBottom: "2px"}}>{submittedRequisition.formData.preparedBy}</span>
+                </div>
               </div>
-              <span className="text-sm font-semibold">Prepared By</span>
-            </div>
-            <div className="text-center">
-              <div className="border-b border-foreground pb-1 mb-2 min-h-[60px] flex items-end justify-center">
-                <span className="font-medium">{submittedRequisition.formData.notedBy}</span>
+              <div style={{textAlign: "center"}}>
+                <span style={{fontSize: "11pt", fontWeight: "bold", display: "block", marginBottom: "4px"}}>Noted By:</span>
+                <div style={{borderBottom: "1.5px solid #000", height: "24px", marginBottom: "6px", display: "flex", alignItems: "flex-end", justifyContent: "center"}}>
+                  <span style={{fontSize: "10pt", marginBottom: "2px"}}>{submittedRequisition.formData.notedBy}</span>
+                </div>
+                <span style={{fontSize: "9pt", color: "#333", fontWeight: "500"}}>Department Head</span>
               </div>
-              <span className="text-sm font-semibold">Noted By</span>
-            </div>
-            <div className="text-center">
-              <div className="border-b border-foreground pb-1 mb-2 min-h-[60px] flex items-end justify-center">
-                <span className="font-medium">{submittedRequisition.formData.approvedBy}</span>
+              <div style={{textAlign: "center"}}>
+                <span style={{fontSize: "11pt", fontWeight: "bold", display: "block", marginBottom: "4px"}}>Approved By:</span>
+                <div style={{borderBottom: "1.5px solid #000", height: "24px", marginBottom: "6px", display: "flex", alignItems: "flex-end", justifyContent: "center"}}>
+                  <span style={{fontSize: "10pt", marginBottom: "2px"}}>{submittedRequisition.formData.approvedBy}</span>
+                </div>
+                <span style={{fontSize: "9pt", color: "#333", fontWeight: "500"}}>CFO</span>
               </div>
-              <span className="text-sm font-semibold">Approved By</span>
+              <div style={{textAlign: "center"}}>
+                <span style={{fontSize: "11pt", fontWeight: "bold", display: "block", marginBottom: "4px"}}>Approved By:</span>
+                <div style={{borderBottom: "1.5px solid #000", height: "24px", marginBottom: "6px", display: "flex", alignItems: "flex-end", justifyContent: "center"}}>
+                  <span style={{fontSize: "10pt", marginBottom: "2px"}}>{submittedRequisition.formData.approvedByCOO}</span>
+                </div>
+                <span style={{fontSize: "9pt", color: "#333", fontWeight: "500"}}>COO</span>
+              </div>
             </div>
           </div>
         </div>
@@ -337,19 +479,184 @@ export function RequisitionForm() {
     );
   }
 
+  // Show records view
+  if (view === "records") {
+    return (
+      <Card className="max-w-6xl mx-auto">
+        <CardHeader className="border-b bg-primary/5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-full bg-primary flex items-center justify-center">
+                <FileText className="w-6 h-6 text-primary-foreground" />
+              </div>
+              <div>
+                <CardTitle className="text-2xl">Requisition Records</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  View all submitted requisitions
+                </p>
+              </div>
+            </div>
+            <Button onClick={handleNewRequisition}>
+              <Plus className="w-4 h-4 mr-2" />
+              Create New Requisition
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="pt-6">
+          {/* Filter Toggle */}
+          <div className="mb-4 flex gap-2">
+            <Button
+              variant={!showArchived ? "default" : "outline"}
+              onClick={() => setShowArchived(false)}
+              size="sm"
+            >
+              Active Requisitions
+            </Button>
+            <Button
+              variant={showArchived ? "default" : "outline"}
+              onClick={() => setShowArchived(true)}
+              size="sm"
+            >
+              Archived Requisitions
+            </Button>
+          </div>
+
+          {recordsLoading ? (
+            <div className="flex justify-center items-center py-12">
+              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              <span className="ml-2 text-muted-foreground">Loading records...</span>
+            </div>
+          ) : submittedRequisitions.filter((req) => (showArchived ? req.status === "archived" : req.status !== "archived")).length === 0 ? (
+            <div className="text-center py-12">
+              <p className="text-muted-foreground">
+                {showArchived ? "No archived requisitions found." : "No active requisitions found."}
+              </p>
+              {!showArchived && (
+                <Button onClick={handleNewRequisition} className="mt-4">
+                  Create a new requisition
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-lg border overflow-hidden">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-muted/50">
+                    <TableHead className="font-semibold">Requisition #</TableHead>
+                    <TableHead className="font-semibold">Department</TableHead>
+                    <TableHead className="font-semibold">Request Date</TableHead>
+                    <TableHead className="font-semibold">Need Date</TableHead>
+                    <TableHead className="font-semibold">Items</TableHead>
+                    <TableHead className="font-semibold">Total Amount</TableHead>
+                    <TableHead className="font-semibold">Status</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {submittedRequisitions.filter((req) => (showArchived ? req.status === "archived" : req.status !== "archived")).map((req) => {
+                    const totalAmount = (req.items || []).reduce((sum: number, item: any) => sum + item.totalPrice, 0);
+                    return (
+                      <TableRow key={req.id}>
+                        <TableCell className="font-semibold text-primary">{req.requisitionNumber}</TableCell>
+                        <TableCell>{req.department}</TableCell>
+                        <TableCell>{formatDate(req.requestDate)}</TableCell>
+                        <TableCell>{formatDate(req.needDate)}</TableCell>
+                        <TableCell className="text-center">{(req.items || []).length}</TableCell>
+                        <TableCell className="text-right font-semibold">{formatCurrency(totalAmount)}</TableCell>
+                        <TableCell>
+                          <span className={`px-2 py-1 rounded-full text-xs font-semibold ${
+                            req.status === "archived" 
+                              ? "bg-gray-100 text-gray-800" 
+                              : "bg-yellow-100 text-yellow-800"
+                          }`}>
+                            {req.status === "archived" ? "archived" : "pending"}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex gap-2 justify-end">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleViewPrint(req)}
+                              title="View details"
+                            >
+                              <Printer className="w-3 h-3" />
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleEditRequisition(req)}
+                              title="Edit"
+                              className="text-blue-600"
+                            >
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                              </svg>
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleArchiveRequisition(req.id, req.status)}
+                              title={req.status === "archived" ? "Restore from archive" : "Archive"}
+                              className={req.status === "archived" ? "text-blue-600" : "text-amber-600"}
+                            >
+                              {req.status === "archived" ? (
+                                <ArchiveRestore className="w-3 h-3" />
+                              ) : (
+                                <Archive className="w-3 h-3" />
+                              )}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleDeleteRequisition(req.id)}
+                              title="Delete"
+                              className="text-red-600 hover:bg-red-50"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <Card className="max-w-5xl mx-auto">
       <CardHeader className="border-b bg-primary/5">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-full bg-primary flex items-center justify-center">
-            <FileText className="w-6 h-6 text-primary-foreground" />
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-full bg-primary flex items-center justify-center">
+              <FileText className="w-6 h-6 text-primary-foreground" />
+            </div>
+            <div>
+              <CardTitle className="text-2xl">
+                {isEditing ? "Edit Requisition" : "Requisition Form"}
+              </CardTitle>
+              <p className="text-sm text-muted-foreground mt-1">
+                {isEditing 
+                  ? "Edit and save as new requisition with incremented number" 
+                  : "Create a new purchase requisition"}
+              </p>
+            </div>
           </div>
-          <div>
-            <CardTitle className="text-2xl">Requisition Form</CardTitle>
-            <p className="text-sm text-muted-foreground mt-1">
-              Create a new purchase requisition
-            </p>
-          </div>
+          {isEditing && (
+            <Button 
+              type="button"
+              variant="outline" 
+              onClick={handleNewRequisition}
+            >
+              Cancel
+            </Button>
+          )}
         </div>
       </CardHeader>
       <CardContent className="pt-6">
@@ -510,7 +817,7 @@ export function RequisitionForm() {
           </div>
 
           {/* Approval Section */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-4 border-t">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6 pt-4 border-t">
             <div className="space-y-2">
               <Label htmlFor="preparedBy">Prepared By</Label>
               <Input
@@ -532,29 +839,47 @@ export function RequisitionForm() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="approvedBy">Approved By</Label>
+              <Label htmlFor="approvedBy">Approved By (CFO)</Label>
               <Input
                 id="approvedBy"
-                placeholder="Name of approver"
+                placeholder="Name of CFO"
                 value={formData.approvedBy}
                 onChange={(e) => setFormData({ ...formData, approvedBy: e.target.value })}
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="approvedByCOO">Approved By (COO)</Label>
+              <Input
+                id="approvedByCOO"
+                placeholder="Name of COO"
+                value={formData.approvedByCOO}
+                onChange={(e) => setFormData({ ...formData, approvedByCOO: e.target.value })}
                 required
               />
             </div>
           </div>
 
           {/* Submit Button */}
-          <div className="flex justify-end pt-4">
+          <div className="flex justify-end gap-3 pt-4">
+            <Button 
+              type="button" 
+              variant="outline"
+              onClick={isEditing ? handleNewRequisition : handleViewRecords}
+              size="lg"
+            >
+              {isEditing ? "Cancel" : "View Records"}
+            </Button>
             <Button type="submit" size="lg" disabled={loading || requisitionItems.length === 0}>
               {loading ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Submitting...
+                  {isEditing ? "Saving..." : "Submitting..."}
                 </>
               ) : (
                 <>
                   <Send className="w-4 h-4 mr-2" />
-                  Submit Requisition
+                  {isEditing ? "Save as New Requisition" : "Submit Requisition"}
                 </>
               )}
             </Button>
